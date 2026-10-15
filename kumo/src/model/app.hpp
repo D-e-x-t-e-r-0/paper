@@ -43,6 +43,11 @@ struct FunctionProfile {
     std::vector<std::string> packages;
     std::string              label;       // optional free-form label
 
+    // Risk score in [0,1] (tenant distrust + data sensitivity). The
+    // sandbox model maps it to a minimum isolation level; risk-aware
+    // schedulers use it for co-location-aware placement.
+    double risk = 0.0;
+
     // Timing characteristics (all in the same time unit as TimePoint/Duration).
     Duration cold_start_time = 200.0;     // ms? configurable later
     Duration warm_start_time = 5.0;

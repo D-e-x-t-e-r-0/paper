@@ -12,6 +12,7 @@
 #include "common/types.hpp"
 #include "model/platform_state.hpp"
 #include "model/app.hpp"
+#include "model/sandbox.hpp"
 #include "core/trace_logger.hpp"
 
 namespace kumo {
@@ -32,6 +33,14 @@ struct TenantPairHash {
         x ^= (x >> 33);
         return static_cast<std::size_t>(x);
     }
+};
+
+/// One active invocation, as tracked for co-location-violation accounting.
+struct SandboxActive {
+    TenantId     tenant = 0;
+    SandboxLevel level  = SandboxLevel::Container;
+    int          req    = 0;
+    double       risk   = 0.0;
 };
 
 /**
@@ -160,7 +169,96 @@ public:
         // End-to-end latency includes waiting + cold/warm delay + service time
         double latency = now - inv.arrival_time();
         tenant_latencies_[inv.tenant_id()].push_back(latency);
+        all_latencies_.push_back(latency);
+        if (slo_enabled_ && latency > slo_latency_) {
+            slo_misses_ += 1;
+        }
         inv_exec_start_.erase(inv.id());
+    }
+
+    // ---- Risk-Aware Sandbox Scheduling hooks ---------------------------
+
+    /// Enable / configure the end-to-end latency SLO (ms).
+    void set_slo_latency(double ms) {
+        slo_latency_ = ms;
+        slo_enabled_ = (ms > 0.0);
+    }
+
+    /// Tell the collector whether the sandbox model is active.
+    void set_sandbox_enabled(bool on) { sandbox_enabled_ = on; }
+
+    /**
+     * Called when an invocation is placed on (worker, sandbox level).
+     *
+     * A co-location violation is counted for every *overlapping* pair of
+     * invocations from different tenants whose weakest sandbox boundary
+     * is below the level required by the riskier of the two:
+     *
+     *     iso  = min(level_i, level_j)
+     *     need = max(required(risk_i), required(risk_j))
+     *     violation  <=>  iso < need
+     *
+     * (A shared host is only as safe as its weakest sandbox.)
+     */
+    void on_sandbox_start(const Invocation& inv, WorkerId wid,
+                          SandboxLevel lvl, int req, double risk,
+                          bool warm, TimePoint now)
+    {
+        if (sandbox_enabled_) {
+            auto& act = active_sandbox_[wid];
+            for (const auto& kv : act) {
+                const auto& rec = kv.second;
+                if (rec.tenant == inv.tenant_id()) continue;
+
+                const int iso  = std::min(static_cast<int>(lvl),
+                                          static_cast<int>(rec.level));
+                const int need = std::max(req, rec.req);
+                if (iso < need) {
+                    violations_total_ += 1;
+                    auto key = canonical_pair(rec.tenant, inv.tenant_id());
+                    violations_by_pair_[key] += 1;
+                    violations_by_tenant_[rec.tenant] += 1;
+                    violations_by_tenant_[inv.tenant_id()] += 1;
+                    exposed_invocations_.insert(inv.id());
+                    exposed_invocations_.insert(kv.first);
+                    if (first_violation_time_ < 0.0) {
+                        first_violation_time_ = now;
+                    }
+                }
+            }
+            SandboxActive rec;
+            rec.tenant = inv.tenant_id();
+            rec.level  = lvl;
+            rec.req    = req;
+            rec.risk   = risk;
+            act[inv.id()] = rec;
+        }
+
+        const int li = static_cast<int>(lvl);
+        level_starts_[li] += 1;
+        if (warm) level_warm_[li] += 1;
+        else      level_cold_[li] += 1;
+    }
+
+    /// Called when an invocation using (worker, level) completes.
+    void on_sandbox_finish(const Invocation& inv, WorkerId wid,
+                           SandboxLevel lvl, Duration svc,
+                           Duration overhead, Duration /*start_delay*/,
+                           double cost)
+    {
+        if (sandbox_enabled_) {
+            auto wit = active_sandbox_.find(wid);
+            if (wit != active_sandbox_.end()) {
+                wit->second.erase(inv.id());
+                if (wit->second.empty()) {
+                    active_sandbox_.erase(wit);
+                }
+            }
+        }
+        const int li = static_cast<int>(lvl);
+        level_service_ms_[li] += svc;
+        overhead_total_ += overhead;
+        cost_total_ += cost;
     }
 
 
@@ -280,6 +378,58 @@ public:
         return sum / static_cast<double>(it->second.size());
     }
 
+    // ---- Risk-aware sandbox accessors ----------------------------------
+
+    std::uint64_t violations_total() const noexcept {
+        return violations_total_;
+    }
+
+    const std::unordered_map<std::pair<TenantId, TenantId>,
+                             std::uint64_t,
+                             TenantPairHash>&
+    violations_by_pair() const noexcept {
+        return violations_by_pair_;
+    }
+
+    std::uint64_t violations_for_tenant(TenantId t) const {
+        auto it = violations_by_tenant_.find(t);
+        return (it == violations_by_tenant_.end()) ? 0 : it->second;
+    }
+
+    std::size_t exposed_invocations() const noexcept {
+        return exposed_invocations_.size();
+    }
+
+    double first_violation_time() const noexcept {
+        return first_violation_time_;
+    }
+
+    std::uint64_t level_starts(int level) const { return level_starts_[level]; }
+    std::uint64_t level_cold(int level)   const { return level_cold_[level]; }
+    std::uint64_t level_warm(int level)   const { return level_warm_[level]; }
+    double level_service_ms(int level)    const { return level_service_ms_[level]; }
+
+    double cost_total() const noexcept     { return cost_total_; }
+    double overhead_total() const noexcept { return overhead_total_; }
+
+    std::uint64_t slo_misses() const noexcept { return slo_misses_; }
+    double slo_latency() const noexcept { return slo_latency_; }
+
+    double mean_latency_all() const {
+        if (all_latencies_.empty()) return 0.0;
+        double sum = 0.0;
+        for (double x : all_latencies_) sum += x;
+        return sum / static_cast<double>(all_latencies_.size());
+    }
+
+    double p95_latency_all() const {
+        if (all_latencies_.empty()) return 0.0;
+        auto v = all_latencies_;
+        std::sort(v.begin(), v.end());
+        std::size_t idx = static_cast<std::size_t>(0.95 * (v.size() - 1));
+        return v[idx];
+    }
+
 
 private:
     static std::pair<TenantId, TenantId> canonical_pair(TenantId a, TenantId b) {
@@ -314,6 +464,35 @@ private:
     std::unordered_map<TenantId, std::uint64_t> tenant_drops_;
     std::unordered_map<TenantId, std::vector<double>> tenant_latencies_;
     std::unordered_map<InvocationId, TimePoint> inv_exec_start_;
+
+    // ---- Risk-aware sandbox metrics ----
+    bool sandbox_enabled_ = false;
+
+    // Per worker: active invocations (for pair-wise violation checks).
+    std::unordered_map<WorkerId,
+        std::unordered_map<InvocationId, SandboxActive>> active_sandbox_;
+
+    std::uint64_t violations_total_ = 0;
+    std::unordered_map<std::pair<TenantId, TenantId>,
+                       std::uint64_t,
+                       TenantPairHash> violations_by_pair_;
+    std::unordered_map<TenantId, std::uint64_t> violations_by_tenant_;
+    std::unordered_set<InvocationId> exposed_invocations_;
+    double first_violation_time_ = -1.0;
+
+    std::uint64_t level_starts_[3] = {0, 0, 0};
+    std::uint64_t level_cold_[3]   = {0, 0, 0};
+    std::uint64_t level_warm_[3]   = {0, 0, 0};
+    double        level_service_ms_[3] = {0.0, 0.0, 0.0};
+
+    double overhead_total_ = 0.0;
+    double cost_total_     = 0.0;
+
+    bool          slo_enabled_ = false;
+    double        slo_latency_ = 0.0;
+    std::uint64_t slo_misses_  = 0;
+
+    std::vector<double> all_latencies_;
 };
 
 } // namespace kumo

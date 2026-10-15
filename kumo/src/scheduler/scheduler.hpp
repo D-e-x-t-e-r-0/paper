@@ -5,6 +5,7 @@
 #include <memory>
 
 #include "common/types.hpp"
+#include "model/sandbox.hpp"
 
 namespace kumo {
 
@@ -16,19 +17,21 @@ class Invocation;
 /**
  * Result of a scheduling decision.
  *
- * For now we keep it simple: either we choose a worker, or we fail.
- * Later we can extend this with more details (e.g., reasons, hints
- * for scaling, etc.).
+ * A placement is a (worker, sandbox level) pair: the scheduler chooses
+ * both the host and the isolation level for the invocation.
  */
 struct SchedulingDecision {
     bool     success   = false;
     WorkerId worker_id = 0;
+    SandboxLevel sandbox = SandboxLevel::Container;  // requested isolation
     std::string reason;  // optional human-readable explanation
 
-    static SchedulingDecision ok(WorkerId wid) {
+    static SchedulingDecision ok(WorkerId wid,
+                                 SandboxLevel level = SandboxLevel::Container) {
         SchedulingDecision d;
         d.success   = true;
         d.worker_id = wid;
+        d.sandbox   = level;
         return d;
     }
 

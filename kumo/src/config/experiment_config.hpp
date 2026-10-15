@@ -9,6 +9,7 @@
 #include <unordered_map>
 
 #include "common/types.hpp"
+#include "model/sandbox.hpp"
 #include "workload/attack_workload.hpp"  // for AttackConfig
 
 namespace kumo {
@@ -111,6 +112,27 @@ struct ExperimentConfig {
     // --- NEW for DoS ---
     ServiceTimeConfig service_time;
     WorkerQueueConfig worker_queue;
+
+    // --- NEW for Risk-Aware Sandbox Scheduling ---
+    // Sandbox / isolation model (3 levels: container / gVisor / Kata).
+    SandboxModel sandbox;
+
+    // Per-function risk scores. `risk_tenants[i]` is the risk of tenant
+    // (i+1); tenants beyond the list get `risk_default`.
+    double risk_default = 0.1;
+    std::vector<double> risk_tenants;
+
+    // End-to-end latency SLO (ms). 0 disables SLO accounting.
+    double slo_latency = 0.0;
+
+    // Risk-aware scheduler weights (score = wR*V + wL*L + wC*C + wS*O).
+    double sched_wr = 1000.0;
+    double sched_wl = 1.0;
+    double sched_wc = 50.0;
+    double sched_ws = 1.0;
+    bool   sched_adaptive = true;
+    double sched_target_viol_rate = 0.001;
+    std::vector<double> sweep_risk_wr;
 };
 
 inline ExperimentConfig parse_experiment_config(std::istream& in) {
@@ -376,6 +398,38 @@ inline ExperimentConfig parse_experiment_config(std::istream& in) {
     cfg.service_time.mean  = get_f64("service_time.mean", 20.0);
     cfg.service_time.fixed = get_f64("service_time.fixed", 20.0);
     cfg.worker_queue.max_queue_len = get_u32("worker.max_queue_len", 100);
+
+    // --- Sandbox / risk model -------------------------------------------
+    cfg.sandbox.enabled = get_bool("sandbox.enabled", false);
+    if (cfg.sandbox.enabled) {
+        const SandboxModel d = SandboxModel::defaults();
+        auto parse_level = [&](const std::string& prefix, int idx) {
+            auto& L = cfg.sandbox.levels[idx];
+            L.cold_start  = get_f64("sandbox." + prefix + ".cold",     d.levels[idx].cold_start);
+            L.warm_start  = get_f64("sandbox." + prefix + ".warm",     d.levels[idx].warm_start);
+            L.overhead    = get_f64("sandbox." + prefix + ".overhead", d.levels[idx].overhead);
+            L.cost_per_ms = get_f64("sandbox." + prefix + ".cost",     d.levels[idx].cost_per_ms);
+            L.strength    = d.levels[idx].strength;
+        };
+        parse_level("container", 0);
+        parse_level("gvisor",    1);
+        parse_level("kata",      2);
+    }
+    cfg.sandbox.theta1 = get_f64("risk.theta1", cfg.sandbox.theta1);
+    cfg.sandbox.theta2 = get_f64("risk.theta2", cfg.sandbox.theta2);
+    cfg.risk_default   = get_f64("risk.default", cfg.risk_default);
+    cfg.risk_tenants   = parse_list_f64("risk.tenants");
+    cfg.slo_latency    = get_f64("slo.latency", cfg.slo_latency);
+
+    // --- Risk-aware scheduler weights ------------------------------------
+    cfg.sched_wr = get_f64("sched.wr", cfg.sched_wr);
+    cfg.sched_wl = get_f64("sched.wl", cfg.sched_wl);
+    cfg.sched_wc = get_f64("sched.wc", cfg.sched_wc);
+    cfg.sched_ws = get_f64("sched.ws", cfg.sched_ws);
+    cfg.sched_adaptive = get_bool("sched.adaptive", cfg.sched_adaptive);
+    cfg.sched_target_viol_rate = get_f64("sched.target_viol_rate",
+                                         cfg.sched_target_viol_rate);
+    cfg.sweep_risk_wr = parse_list_f64("sweep.risk_wr");
 
     return cfg;
 }

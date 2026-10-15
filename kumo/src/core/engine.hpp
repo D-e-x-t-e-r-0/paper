@@ -10,6 +10,7 @@
 #include "common/types.hpp"
 #include "model/app.hpp"
 #include "model/platform_state.hpp"
+#include "model/sandbox.hpp"
 #include "scheduler/scheduler.hpp"
 #include "core/event.hpp"
 #include "metrics/metrics.hpp"
@@ -41,9 +42,11 @@ class Engine {
 public:
     std::unordered_map<WorkerId, std::size_t> max_q_seen_;
 
-    Engine(PlatformState platform, SchedulerPtr scheduler)
+    Engine(PlatformState platform, SchedulerPtr scheduler,
+           SandboxModel sandbox = SandboxModel{})
         : platform_(std::move(platform))
         , scheduler_(std::move(scheduler))
+        , sandbox_(sandbox)
     {
         if (!scheduler_) {
             throw std::invalid_argument("Engine requires a non-null Scheduler");
@@ -149,13 +152,43 @@ private:
 
     void handle_invocation_start(const Event& ev) {
         auto it = inv_map_.find(ev.invocation_id);
+        if (it == inv_map_.end()) {
+            return;
+        }
 
         const Invocation& inv = it->second;
         const FunctionProfile* func = platform_.get_function(inv.function_id());
-        // Ask scheduler for placement decision.
+        if (!func) {
+            failed_invocations_.push_back(inv.id());
+            inv_map_.erase(it);
+            return;
+        }
+
+        // Ask scheduler for a (worker, sandbox level) placement decision.
         auto decision = scheduler_->schedule(inv, platform_);
 
         WorkerId wid = decision.worker_id;
+        SandboxLevel lvl = decision.sandbox;
+
+        if (!decision.success) {
+            // No scheduler found a host: fall back to the least-loaded
+            // worker so the invocation can queue instead of being dropped.
+            double best_ratio = 1e18;
+            bool any = false;
+            for (WorkerId cand : platform_.workers()) {
+                const auto& cw = platform_.worker_view(cand);
+                double ratio = (cw.capacity.cpu_cores > 0.0)
+                    ? cw.used.cpu_cores / cw.capacity.cpu_cores : 0.0;
+                if (ratio < best_ratio) { best_ratio = ratio; wid = cand; any = true; }
+            }
+            if (!any) {
+                failed_invocations_.push_back(inv.id());
+                metrics_.on_invocation_drop(inv, wid, current_time_);
+                inv_map_.erase(it);
+                return;
+            }
+            lvl = SandboxLevel::Container;
+        }
 
         auto& w = platform_.mutable_worker(wid);
 
@@ -166,20 +199,25 @@ private:
             w.tenants_present.push_back(inv.tenant_id());
         }
 
-        // Decide warm vs cold: check for an idle container of this function.
+        // Decide warm vs cold: check for an idle container of this
+        // function at the *requested sandbox level*.
         bool has_idle_container = false;
         for (auto& c : w.containers) {
-            if (c.function_id == inv.function_id() && c.is_idle()) {
+            if (c.function_id == inv.function_id() &&
+                c.sandbox == lvl && c.is_idle()) {
                 has_idle_container = true;
                 break;
             }
         }
 
-        // If no container exists at all, create one (cold).
-        if (!has_idle_container && !has_container_for_function(w, inv.function_id())) {
+        // If no container of this (function, level) exists at all, create
+        // one (cold).
+        if (!has_idle_container &&
+            !has_container_for_function(w, inv.function_id(), lvl)) {
             Container c;
             c.function_id = inv.function_id();
             c.worker_id   = wid;
+            c.sandbox     = lvl;
             c.busy        = false;
             c.last_used   = current_time_;
             c.lifetime_invocations = 0;
@@ -193,18 +231,24 @@ private:
             }
         }
 
-        // Determine start delay based on warm vs cold.
-        Duration start_delay = has_idle_container
-            ? func->warm_start_time
-            : func->cold_start_time;
-        
+        // Determine start delay based on warm vs cold and the sandbox model.
+        Duration start_delay;
+        if (sandbox_.enabled) {
+            const auto& sp = sandbox_.level(lvl);
+            start_delay = has_idle_container ? sp.warm_start : sp.cold_start;
+        } else {
+            start_delay = has_idle_container
+                ? func->warm_start_time
+                : func->cold_start_time;
+        }
 
         if (TraceLogger::enabled()) {
             TraceLogger::log("[place] t=", current_time_,
                              " inv=", inv.id(),
                              " func=", inv.function_id(),
                              " tenant=", inv.tenant_id(),
-                             " worker=", wid);
+                             " worker=", wid,
+                             " sandbox=", sandbox_name(lvl));
         }
 
         // Notify metrics collector about placement.
@@ -229,8 +273,22 @@ private:
             }
         }
 
-        // Remember which worker is chosen for this invocation.
-        inv_worker_[inv.id()] = wid;
+        // Sandbox-level bookkeeping + co-location-violation accounting.
+        const int req = sandbox_.required_level(func->risk);
+        metrics_.on_sandbox_start(inv, wid, lvl, req, func->risk,
+                                  has_idle_container, current_time_);
+
+        // Track this active invocation for risk-aware schedulers.
+        w.active_tenants.push_back(
+            ActiveTenant{inv.tenant_id(), lvl, req, func->risk});
+
+        // Remember placement for this invocation.
+        InvocationInfo info;
+        info.worker      = wid;
+        info.level       = lvl;
+        info.start_delay = start_delay;
+        info.overhead    = sandbox_.enabled ? sandbox_.level(lvl).overhead : 0.0;
+        inv_info_[inv.id()] = info;
 
         // Schedule the execution event.
         TimePoint exec_time = current_time_ + start_delay;
@@ -242,14 +300,24 @@ private:
 
     void handle_invocation_execute(const Event& ev) {
         auto inv_it = inv_map_.find(ev.invocation_id);
+        if (inv_it == inv_map_.end()) {
+            return;
+        }
 
         const Invocation& inv = inv_it->second;
         const FunctionProfile* func = platform_.get_function(inv.function_id());
+        if (!func) {
+            inv_map_.erase(inv_it);
+            inv_info_.erase(inv.id());
+            return;
+        }
 
         WorkerId wid = ev.worker_id;
-        auto worker_it = inv_worker_.find(inv.id());
-        if (worker_it != inv_worker_.end()) {
-            wid = worker_it->second;
+        SandboxLevel lvl = SandboxLevel::Container;
+        auto info_it = inv_info_.find(inv.id());
+        if (info_it != inv_info_.end()) {
+            wid = info_it->second.worker;
+            lvl = info_it->second.level;
         }
 
         auto& w = platform_.mutable_worker(wid);
@@ -261,12 +329,11 @@ private:
             
             if (q.size() >= max_queue_len_) {
                 // hard drop (this is the only real "failed" in DoS model)
-                // std::cout << "[drop] t=" << current_time_ << " inv=" << inv.id() << " worker=" << wid << std::endl;
                 failed_invocations_.push_back(inv.id());
                 metrics_.on_invocation_drop(inv, wid, current_time_);
 
                 inv_map_.erase(inv_it);
-                inv_worker_.erase(inv.id());
+                inv_info_.erase(inv.id());
                 return;
             }
 
@@ -284,10 +351,12 @@ private:
 
         // At this point, we are actually going to execute now.
 
-        // Find an idle container for this function; if none, create one.
+        // Find an idle container for this (function, sandbox level);
+        // if none, create one.
         Container* container = nullptr;
         for (auto& c : w.containers) {
-            if (c.function_id == inv.function_id() && c.is_idle()) {
+            if (c.function_id == inv.function_id() &&
+                c.sandbox == lvl && c.is_idle()) {
                 container = &c;
                 break;
             }
@@ -296,6 +365,7 @@ private:
             Container c;
             c.function_id = inv.function_id();
             c.worker_id   = wid;
+            c.sandbox     = lvl;
             c.busy        = false;
             c.last_used   = current_time_;
             c.lifetime_invocations = 0;
@@ -324,14 +394,21 @@ private:
                             " inv=", inv.id(),
                             " func=", inv.function_id(),
                             " worker=", wid,
+                            " sandbox=", sandbox_name(lvl),
                             " container_lifetime=", container->lifetime_invocations);
         }
 
         // record actual execution start time for latency
         metrics_.on_invocation_execute(inv, wid, current_time_);
 
-        // Schedule completion after service time.
-        TimePoint completion_time = current_time_ + inv.service_time();
+        // Sandbox overhead is added to the service time.
+        Duration overhead = sandbox_.enabled ? sandbox_.level(lvl).overhead : 0.0;
+        if (info_it != inv_info_.end()) {
+            info_it->second.overhead = overhead;
+        }
+
+        // Schedule completion after service time (+ sandbox overhead).
+        TimePoint completion_time = current_time_ + inv.service_time() + overhead;
         events_.push(Event::invocation_complete(completion_time,
                                                 inv.id(),
                                                 inv.function_id(),
@@ -349,14 +426,20 @@ private:
         const FunctionProfile* func = platform_.get_function(inv.function_id());
         if (!func) {
             inv_map_.erase(inv_it);
-            inv_worker_.erase(inv.id());
+            inv_info_.erase(inv.id());
             return;
         }
 
         WorkerId wid = ev.worker_id;
-        auto worker_it = inv_worker_.find(inv.id());
-        if (worker_it != inv_worker_.end()) {
-            wid = worker_it->second;
+        SandboxLevel lvl = SandboxLevel::Container;
+        Duration overhead = 0.0;
+        Duration start_delay = 0.0;
+        auto info_it = inv_info_.find(inv.id());
+        if (info_it != inv_info_.end()) {
+            wid         = info_it->second.worker;
+            lvl         = info_it->second.level;
+            overhead    = info_it->second.overhead;
+            start_delay = info_it->second.start_delay;
         }
 
         auto& w = platform_.mutable_worker(wid);
@@ -386,6 +469,14 @@ private:
             }
         }
 
+        // Drop this invocation from the worker's active-tenant list.
+        for (auto a = w.active_tenants.begin(); a != w.active_tenants.end(); ++a) {
+            if (a->tenant == inv.tenant_id()) {
+                w.active_tenants.erase(a);
+                break;
+            }
+        }
+
         if (TraceLogger::enabled()) {
             TraceLogger::log("[complete] t=", current_time_,
                              " inv=", inv.id(),
@@ -398,6 +489,15 @@ private:
 
         // NEW: record end-to-end latency
         metrics_.on_invocation_finish(inv, current_time_);
+
+        // Sandbox-level finish accounting (cost, overhead, per-level totals).
+        double cost = 0.0;
+        if (sandbox_.enabled) {
+            cost = sandbox_.level(lvl).cost_per_ms *
+                   (start_delay + inv.service_time() + overhead);
+        }
+        metrics_.on_sandbox_finish(inv, wid, lvl, inv.service_time(),
+                                   overhead, start_delay, cost);
 
         // NEW: if queue has work, start next immediately
         auto qit = waitq_.find(wid);
@@ -424,7 +524,7 @@ private:
         }
 
         inv_map_.erase(inv_it);
-        inv_worker_.erase(inv.id());
+        inv_info_.erase(inv.id());
     }
     void handle_container_cool(const Event& ev) {
         WorkerId wid = ev.worker_id;
@@ -461,24 +561,35 @@ private:
         }
     }
 
-    bool has_container_for_function(const WorkerView& w, FunctionId func_id) const {
+    bool has_container_for_function(const WorkerView& w, FunctionId func_id,
+                                    SandboxLevel lvl) const {
         for (const auto& c : w.containers) {
-            if (c.function_id == func_id) return true;
+            if (c.function_id == func_id && c.sandbox == lvl) return true;
         }
         return false;
     }
 
 private:
+    /// Bookkeeping for an in-flight invocation.
+    struct InvocationInfo {
+        WorkerId     worker      = 0;
+        SandboxLevel level       = SandboxLevel::Container;
+        Duration     start_delay = 0.0;
+        Duration     overhead    = 0.0;
+    };
+
+private:
     PlatformState platform_;
     SchedulerPtr  scheduler_;
+    SandboxModel  sandbox_;
 
     TimePoint current_time_ = 0.0;
 
     // All pending/running invocations (by ID).
     std::unordered_map<InvocationId, Invocation> inv_map_;
 
-    // Mapping invocation -> worker running it.
-    std::unordered_map<InvocationId, WorkerId> inv_worker_;
+    // Placement bookkeeping for in-flight invocations.
+    std::unordered_map<InvocationId, InvocationInfo> inv_info_;
 
     // Event priority queue (earliest time first).
     std::priority_queue<Event,

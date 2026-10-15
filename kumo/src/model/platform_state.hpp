@@ -8,8 +8,22 @@
 #include "common/types.hpp"
 #include "model/app.hpp"   // for FunctionProfile and ResourceConfig
 #include "model/container.hpp"
+#include "model/sandbox.hpp"
 
 namespace kumo {
+
+/**
+ * A currently-active (running) invocation's tenant, as seen by the
+ * scheduler. Used to predict co-location violations for a candidate
+ * placement: the weakest boundary in a co-located pair determines
+ * whether cross-tenant attack surfaces exist.
+ */
+struct ActiveTenant {
+    TenantId     tenant = 0;
+    SandboxLevel level  = SandboxLevel::Container;  // sandbox of the active invocation
+    int          req    = 0;    // its risk-required level
+    double       risk   = 0.0;
+};
 
 /**
  * A read-mostly view of a worker ("invoker") in the platform.
@@ -27,6 +41,9 @@ struct WorkerView {
     std::vector<FunctionId> warm_functions;  // functions with at least one warm container
     std::vector<Container> containers;
     std::vector<TenantId>   tenants_present; // tenants currently running here
+
+    // Active invocations with their tenant / sandbox / risk info.
+    std::vector<ActiveTenant> active_tenants;
 
     std::size_t active_invocations = 0;      // total in-flight invocations
 };
