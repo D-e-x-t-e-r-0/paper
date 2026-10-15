@@ -1,0 +1,4 @@
+# Build outputs
+/main.pdf
+/kumo/kumo_experiment
+/kumo/*.o
