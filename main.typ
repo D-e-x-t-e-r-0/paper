@@ -8,8 +8,10 @@
 #let authors = (
   (
     name: [Jayesh Puri],
-    // TODO: replace with a real contact email; the template links it as a mailto.
-    email: [jayesh.puri\@example.edu],
+    // `email` sets the mailto target of the name link in the template.
+    email: [jayeshkrishan.puri.min24\@iitbhu.ac.in],
+    // Extra keys render as centered lines under the name.
+    contact: [jayeshkrishan.puri.min24\@iitbhu.ac.in],
   ),
 )
 
