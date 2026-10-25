@@ -1,41 +1,24 @@
-#import "@preview/clean-acmart:0.0.1": acmart, acmart-ccs, acmart-keywords, acmart-ref, to-string
+#import "wired-ieee.typ": ieee
 #import "@preview/cetz:0.3.4": canvas, draw
 
-#let title = [
-  Risk-Aware Sandbox Scheduling
-]
+#let title = "Risk-Aware Sandbox Scheduling"
 
 #let authors = (
-  (
-    name: [Jayesh Puri],
-    // `email` sets the mailto target of the name link in the template.
-    email: [jayeshkrishan.puri.min24\@iitbhu.ac.in],
-    // Extra keys render as centered lines under the name.
-    contact: [jayeshkrishan.puri.min24\@iitbhu.ac.in],
-  ),
+  (name: "Jayesh Puri"),
 )
 
-#let conference = (
-  // TODO: adjust or remove the course line if this is not submitted for the course.
-  name:  [CSE-574 Cloud Computing],
-  short: [CSE-574],
-  year:  [2026],
-  date:  [Fall],
-  venue: [Course Project],
-)
-
-#let doi = "https://doi.org/10.1145/0000000000"
-
-#let ccs = (
-  (
-    generic: [Security and privacy],
-    specific: ([Distributed systems security], ),
-  ),
-  (
-    generic: [Computer systems organization],
-    specific: ([Cloud computing], ),
-  ),
-)
+#let author-block = align(center, [
+  #text(size: 11pt, weight: "bold")[Jayesh Puri]
+  #v(4pt)
+  #text(size: 10pt)[
+    Department of Mining Engineering, \
+    Indian Institute of Technology (BHU), Varanasi
+  ]
+  #v(6pt)
+  #text(font: "Courier New", size: 10pt, "{jayeshkrishan.puri.min24@iitbhu.ac.in}") \
+  #text(font: "Courier New", size: 10pt, "{prasenjit.cse@iitbhu.ac.in}" 
+//  #text(font: "Courier New", size: 10pt, "{jayeshkrishan.puri.min24,prasenjit.cse}@iitbhu.ac.in")
+])
 
 #let keywords = (
   "serverless computing",
@@ -45,16 +28,38 @@
   "microVM isolation",
 )
 
-#show: acmart.with(
+#let abstract = [
+  Serverless platforms pack many tenants' functions onto shared workers, and the
+  container sandboxes that make this packing efficient also put tenants within
+  reach of each other. An attacker who lands on the same host as a victim can
+  probe shared kernel interfaces and timing behaviour. Stronger sandboxes such as
+  gVisor and microVMs reduce that exposure. They also start more slowly, add
+  per-invocation overhead and lower host density. This paper develops risk-aware
+  sandbox scheduling, in which the scheduler chooses the host, the sandbox level
+  and the warm-or-cold path for every invocation using a per-function risk score.
+  Placement is scored against a co-location model in which a shared host is only
+  as safe as its weakest sandbox. The scheduler can then protect a risky function
+  by upgrading its isolation or by keeping it away from weakly isolated tenants.
+  We plan to implement the scheduler in Kumo, a security-focused serverless
+  simulator, and to compare it with container-only schedulers, static risk-tier
+  assignment, predictive cold-start policies, always-isolate and segregation-only
+  placement. The evaluation will measure co-location violations, tail latency,
+  SLO misses, cold-start rate, sandbox overhead and cost across attacker
+  intensities and cluster sizes. The goal is the violation profile of an
+  always-isolate policy, at latency and cost close to container-only scheduling.
+  We claim no experimental results; this document is the design and evaluation
+  blueprint.
+]
+
+#show: ieee.with(
   title: title,
   authors: authors,
-  conference: conference,
-  doi: doi,
-  copyright: "cc",
+  author-block: author-block,
+  abstract: abstract,
+  index-terms: keywords,
+  bibliography: bibliography("refs.bib"),
+  lang: "en",
 )
-
-#set math.equation(numbering: "(1)")
-#show figure.where(kind: table): set figure.caption(position: top)
 
 // Diagrams, drawn with cetz in the style of the reference papers.
 #let d-blue    = rgb("#3B6EA5")
@@ -226,40 +231,13 @@
   content((x(340), 1.75), text(5.8pt, fill: d-red)[misses SLO], anchor: "south")
 })
 
-= Abstract
-
-Serverless platforms pack many tenants' functions onto shared workers, and the
-container sandboxes that make this packing efficient also put tenants within
-reach of each other. An attacker who lands on the same host as a victim can
-probe shared kernel interfaces and timing behaviour. Stronger sandboxes such as
-gVisor and microVMs reduce that exposure, at the price of longer cold starts,
-higher per-invocation overhead and lower host density. This paper develops
-risk-aware sandbox scheduling, in which the scheduler decides the host, the
-sandbox level and the warm-or-cold path for every invocation using a
-per-function risk score. Placement is scored against a co-location model in
-which a shared host is only as safe as its weakest sandbox, so the scheduler
-can protect a risky function either by upgrading its isolation or by keeping it
-away from weakly isolated tenants. We plan to implement the scheduler in Kumo,
-a security-focused serverless simulator, and to compare it with container-only
-schedulers, static risk-tier assignment, predictive cold-start policies,
-always-isolate and segregation-only placement. The evaluation will measure
-co-location violations, tail latency, SLO misses, cold-start rate, sandbox
-overhead and cost across attacker intensities and cluster sizes. The target is
-the violation profile of an always-isolate policy at a latency and cost close
-to container-only scheduling. No experimental results are claimed yet; this
-document is the design and evaluation blueprint.
-
-#acmart-ccs(ccs)
-#acmart-keywords(keywords)
-#acmart-ref(to-string(title), authors, conference, doi)
-
 = Introduction
 
 Serverless platforms execute each function invocation inside a sandbox on a
 shared cluster. Providers keep sandboxes warm and reuse them to avoid
 provisioning delays, and they pack many tenants' functions onto the same
-physical hosts to raise utilization. The packing is what makes the model
-economical for both sides.
+physical hosts to raise utilization. That packing keeps the model economical for
+both sides.
 
 The same packing creates attack surface. Close Talker shows that an attacker
 can fingerprint a scheduler and steer invocations until they land on the same
@@ -269,34 +247,34 @@ changes measured co-location rates by orders of magnitude
 invocations; microarchitectural side channels and network-level flooding are
 outside its scope, and we adopt the same boundary for the scheduler.
 
-Isolation is available in several strengths. Shared-kernel containers are the
-default and the cheapest option. gVisor interposes a user-space kernel between
-the workload and the host, and its measured cost on syscall-heavy workloads is
-substantial @gvisor. MicroVM sandboxes such as Firecracker and Kata Containers
-give each workload a separate kernel; Firecracker was built to make this
-affordable for serverless, but a microVM still starts slower than a container
-@firecracker @kata. Cold starts are a known pain point even without stronger
-isolation: the Azure Functions workload study describes bursty, heavily skewed
-arrivals that make warm reuse hard @serverlesswild, and MPC-style predictive
-policies pre-warm containers to cut tail latency @mpc.
+Sandboxes come in several strengths. Shared-kernel containers are the default
+and the cheapest option. gVisor interposes a user-space kernel between the
+workload and the host; Young et al. measure substantial overhead on
+syscall-heavy workloads @gvisor. MicroVM sandboxes such as Firecracker and Kata
+Containers give each workload a separate kernel. Firecracker was built to make
+this affordable for serverless, but a microVM still starts slower than a
+container @firecracker @kata. Cold starts hurt even without stronger isolation.
+The Azure Functions workload study describes bursty, heavily skewed arrivals
+that make warm reuse hard @serverlesswild, and MPC-style predictive policies
+pre-warm containers to cut tail latency @mpc.
 
 Placement policies, however, treat isolation as fixed. OpenWhisk-style bin
-packing, helper and spread policies in Kumo choose hosts and ignore the sandbox
-@kumo. Double-Dip lowers co-location by preferring hosts where the same user
-already runs, but it reasons about user counts and a single isolation level
+packing and Kumo's helper and spread policies choose hosts and ignore the
+sandbox @kumo. Double-Dip lowers co-location by preferring hosts where the same
+user already runs, but it reasons about user counts and a single isolation level
 @closetalker. MPC forecasts load and reuses containers without asking who else
-shares the host @mpc. Security studies show that placement decides exposure,
-and the schedulers that decide placement do not optimize for it. We ask whether
-the scheduler can treat the sandbox level as a decision variable alongside the
-host and the warm-or-cold path.
+shares the host @mpc. Placement therefore decides exposure, yet the schedulers
+that decide placement do not optimize for it. We ask whether the scheduler can
+treat the sandbox level as a decision variable alongside the host and the
+warm-or-cold path.
 
 Our design assigns each function a risk score from tenant distrust, data
-sensitivity and co-location history, and maps the score to a required isolation
-tier. A placement is a (host, sandbox level) pair. Candidates are scored by a
-weighted sum of expected co-location violation, latency, cost and sandbox
-overhead, and the risk weight adapts online: it grows while risky placements
-are being accepted and decays when the system is calm. A risky function can be
-protected by upgrading its sandbox, by segregating it from weakly isolated
+sensitivity and co-location history, then maps that score to a required
+isolation tier. A placement is a (host, sandbox level) pair. Candidates are
+scored by a weighted sum of expected co-location violation, latency, cost and
+sandbox overhead. The risk weight adapts online: it grows when too many risky
+placements are accepted and decays when the system is calm. A risky function can
+be protected by upgrading its sandbox, by segregating it from weakly isolated
 tenants, or by both, depending on what capacity allows.
 
 This document is a blueprint. It fixes the model and the design, and lays out
@@ -318,16 +296,16 @@ revision. The contributions we plan to deliver are:
 
 OpenWhisk runs each invocation in a container and keeps containers alive for a
 bounded idle time; the keep-alive policy trades memory against cold-start
-frequency @openwhisk. The serverless execution model also raises systems
-questions that predate the current platforms @hellerstein. The Serverless in
-the Wild study of Azure Functions reports bursty, heavily skewed workloads
-where a small fraction of functions receives most of the traffic, which is why
-warm reuse and pre-warming matter @serverlesswild. MPC models arrivals with a
-forecast, then solves a receding-horizon problem that decides when to pre-warm,
-dispatch and reclaim containers, and reports large reductions in tail latency
-@mpc. These systems optimize the reuse decision under the assumption that reuse
-is safe for everyone sharing the host. Our scheduler keeps the reuse decision
-and adds the isolation level to it.
+frequency @openwhisk. The execution model also raises systems questions that
+predate today's platforms @hellerstein. The Serverless in the Wild study of
+Azure Functions reports bursty, heavily skewed workloads, where a small fraction
+of functions receives most of the traffic. That skew is why warm reuse and
+pre-warming matter @serverlesswild. MPC models arrivals with a forecast and
+solves a receding-horizon problem that decides when to pre-warm, dispatch and
+reclaim containers. It reports large reductions in tail latency @mpc. These
+systems optimize the reuse decision under the assumption that reuse is safe for
+everyone sharing the host. Our scheduler keeps the reuse decision and adds the
+isolation level to it.
 
 == Co-location attacks and the Kumo simulator
 
@@ -344,20 +322,20 @@ attacker and victim as first-class entities and metrics for co-location
 probability, time to first co-location, drops and tail latency. It ships with
 Random, Double-Dip, Helper and OpenWhisk schedulers, and shows that policy
 choice moves co-location by orders of magnitude @kumo. Kumo measures the
-problem; we add a policy that optimizes it, and we extend its metrics with
+problem. We add a policy that optimizes for it and extend Kumo's metrics with
 sandbox strength and risk tiers.
 
 == Isolation mechanisms
 
 A shared-kernel container gives the weakest boundary: every tenant on a host
 reaches the same kernel surface. gVisor reduces that surface with a user-space
-kernel that intercepts syscalls, at a cost measured by Young et al. on real
-workloads @gvisor. Firecracker is a microVM designed for serverless with low
-per-VM memory and boot overhead @firecracker, and Kata Containers packages the
-same idea behind container tooling @kata. We model the three options as levels
-with different protection strength, cold-start latency, per-invocation
-overhead and cost. The parameters are simulator inputs; we calibrate them
-against published measurements and check sensitivity.
+kernel that intercepts syscalls; Young et al. measure the cost on real workloads
+@gvisor. Firecracker is a microVM designed for serverless with low per-VM memory
+and boot overhead @firecracker, and Kata Containers packages the same idea
+behind container tooling @kata. We model the three options as levels with
+different protection strength, cold-start latency, per-invocation overhead and
+cost. The parameters are simulator inputs; we calibrate them against published
+measurements and check sensitivity.
 
 == Placement policies
 
@@ -381,7 +359,7 @@ heterogeneity as an extension.
 
 == Sandbox levels and risk tiers
 
-The platform offers three levels, $K = { "shared", "isolated", "dedicated" }$:
+We consider three levels, $K = { "shared", "isolated", "dedicated" }$:
 shared-kernel containers, gVisor and Kata/microVM. Level $k$ has isolation
 strength $s_k$, cold-start latency $c_k$, warm-start latency $h_k$,
 per-invocation overhead $o_k$ and cost per unit time $gamma_k$ (@fig:timeline
@@ -418,9 +396,9 @@ stronger requirement:
 
 $ "viol"(i, i') <=> min(k_i, k_(i')) < max("req"(r_i), "req"(r_(i'))) $ <eq:viol>
 
-The rationale: a host is as safe as its weakest boundary, so certifying a
-tier-$t$ function requires every co-tenant to sit at tier $t$ or above, or the
-function to run without co-tenants (@fig:violation). We count each overlapping
+The reasoning is that a host is only as safe as its weakest boundary. A
+tier-$t$ function is therefore safe only when every co-tenant sits at tier $t$
+or above, or when it runs alone (@fig:violation). We count each overlapping
 pair once, when the second invocation starts. This extends Kumo's co-location
 counts with sandbox levels and risk tiers.
 
@@ -437,8 +415,8 @@ For each invocation, choose $(j, k)$ to minimize the expected cost
 
 $ min alpha dot "Risk" + beta dot "Latency" + gamma dot "Overhead" + delta dot "Cost" $ <eq:obj>
 
-subject to host capacity, with risky functions expected to reach their tier or
-be isolated by placement. The problem is online: future arrivals, loads and
+subject to host capacity. Risky functions must reach their required tier or run
+without weak co-tenants. The problem is online: future arrivals, loads and
 reuse states are unknown, so we use one-step scoring with online weight
 adaptation rather than a horizon optimizer.
 
@@ -528,8 +506,8 @@ initial setup, all relative) and the risk weight adapts.
 Under the weakest-link rule, matching a function's own tier is not enough on a
 mixed host: a mid-risk function in gVisor still violates when a neighbour runs
 in a plain container. The scheduler has two ways to avoid the penalty. It can
-upgrade the neighbourhood, placing the function where every co-tenant meets the
-tier, which builds tiered pools over time. Or it can segregate: place the
+upgrade the neighbourhood by placing the function where every co-tenant meets
+the tier; over time this builds tiered pools. Or it can segregate: place the
 function where it has no weak co-tenants, and rely on the scoring to steer
 later arrivals away, since those arrivals see the risky tenant in their own
 $V$ term. Low-risk functions pack freely.
@@ -539,9 +517,9 @@ $V$ term. Low-risk functions pack freely.
 The risk weight $w_R$ starts at a configured value and tracks an exponentially
 weighted moving average of accepted risky placements. When the observed rate
 exceeds a target (0.001 in our initial setup), the weight grows by 5% per
-decision; otherwise it decays by 0.5% per decision, within bounds. The intent:
-keep cheap placements available in steady state, and let the weight rise when
-the scheduler is being pushed to accept risk, for example during bursts. A
+decision; otherwise it decays by 0.5% per decision, within bounds. The intent is
+to keep cheap placements available in steady state and to let the weight rise
+when the scheduler is pushed to accept risk, for example during bursts. A
 large $w_R$ reproduces a strict tier filter, so the scoring form is a superset
 of the filter used in our initial formulation.
 
@@ -573,12 +551,13 @@ We extend Kumo with a sandbox field on containers and scheduling decisions,
 per-function risk tags, violation, cost, overhead and SLO accounting, and the
 scheduler described above. Initial settings use a 300 ms latency SLO, cold
 starts of 100, 250 and 400 ms, and per-invocation overheads of 0, 3 and 1 ms
-for the shared, isolated and dedicated levels (@fig:timeline); cost rates are
-set per level and E5 sweeps all of these parameters. Workloads come from
-Kumo's generators: uniform, Poisson and burst. Tenants carry a mix of risk scores (low, mid, high). An
-optional attacker workload follows victim invocations at intensities from 0 to
-10 attacks per benign invocation, as in Kumo's attack studies @kumo. We sweep
-cluster size and random seeds, and report means with dispersion.
+for the shared, isolated and dedicated levels (@fig:timeline). Cost rates are
+set per level, and E5 sweeps all of these parameters. Workloads come from
+Kumo's generators: uniform, Poisson and burst. Tenants carry a mix of risk
+scores (low, mid, high). An optional attacker workload follows victim
+invocations at intensities from 0 to 10 attacks per benign invocation, as in
+Kumo's attack studies @kumo. We sweep cluster size and random seeds, and report
+means with dispersion.
 
 == Metrics
 
@@ -649,10 +628,15 @@ outside our scope.
 
 = Conclusion
 
-We have presented the model and design of risk-aware sandbox scheduling and the
-evaluation plan to test it. The question is whether a single scoring function
-can reach the violation profile of always-isolate placement while keeping the
-latency and cost of container-only scheduling. The Kumo extension and the
-baseline port are the next step; measured results will follow.
+We have presented the design of risk-aware sandbox scheduling and a plan to
+evaluate it. The question is whether a single scoring function can reach the
+violation profile of always-isolate placement while keeping the latency and cost
+of container-only scheduling. The Kumo extension and the baseline port are the
+next step; measured results will follow.
 
-#bibliography("refs.bib", title: "References", style: "association-for-computing-machinery")
+= Acknowledgment
+
+This work was carried out under the supervision of
+#link("https://iitbhu.ac.in/dept/cse/people/prasenjitcse")[Prof. Prasenjit Chanak],
+Department of Computer Science and Engineering, Indian Institute of Technology
+(BHU) Varanasi.
